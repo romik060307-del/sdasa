@@ -1,0 +1,192 @@
+name: Build OHLI Social Server APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build OHLI Social for Android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout OHLI repository
+        uses: actions/checkout@v4
+
+      - name: Locate Android Gradle project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR=""
+          ARCHIVE="OHLI-Social-Source-v3.6.27-BUILD-FIX.zip"
+          if [ -f "$ARCHIVE" ]; then
+            mkdir -p .rk-build-src
+            unzip -q -o "$ARCHIVE" -d .rk-build-src
+            SOURCE_DIR="$GITHUB_WORKSPACE/.rk-build-src"
+          elif [ -f "$GITHUB_WORKSPACE/settings.gradle" ] && [ -f "$GITHUB_WORKSPACE/app/build.gradle" ]; then
+            SOURCE_DIR="$GITHUB_WORKSPACE"
+          else
+            SETTINGS_FILE=$(find . -mindepth 2 -maxdepth 5 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)
+            if [ -n "$SETTINGS_FILE" ]; then SOURCE_DIR="$(cd "$(dirname "$SETTINGS_FILE")" && pwd)"; fi
+          fi
+          if [ -z "$SOURCE_DIR" ] || [ ! -f "$SOURCE_DIR/settings.gradle" ] || [ ! -f "$SOURCE_DIR/app/build.gradle" ]; then
+            echo "Gradle project tidak ditemukan. Letakkan ZIP v3.6.27 di root repository atau ekstrak source ke root." >&2
+            ls -la
+            exit 1
+          fi
+          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
+          echo "Android project ditemukan: $SOURCE_DIR"
+
+      - name: Checkout official Cloudflare cloudflared source
+        uses: actions/checkout@v4
+        with:
+          repository: cloudflare/cloudflared
+          ref: 2026.10.7
+          path: .cloudflared-src
+          persist-credentials: false
+
+      - name: Set up Go from pinned Cloudflare source
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: .cloudflared-src/go.mod
+          cache: true
+          cache-dependency-path: .cloudflared-src/go.sum
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018'
+
+      - name: Build Android-native cloudflared executables
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/aarch64-linux-android21-clang"
+          # NDK r27 may omit the API-19 ARMv7 convenience wrapper. Use the
+          # NDK's universal clang driver with an explicit API-19 target instead.
+          if [ ! -x "$TOOLCHAIN/armv7a-linux-androideabi19-clang" ]; then
+            cat > "$TOOLCHAIN/armv7a-linux-androideabi19-clang" <<EOF
+          #!/usr/bin/env bash
+          exec "$TOOLCHAIN/clang" --target=armv7a-linux-androideabi19 "$@"
+          EOF
+            chmod 755 "$TOOLCHAIN/armv7a-linux-androideabi19-clang"
+          fi
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/armv7-ndk-probe.c"
+          "$TOOLCHAIN/armv7a-linux-androideabi19-clang" -fsyntax-only "$RUNNER_TEMP/armv7-ndk-probe.c"
+          mkdir -p "$SOURCE_DIR/app/src/main/jniLibs/arm64-v8a" \
+                   "$SOURCE_DIR/app/src/main/jniLibs/armeabi-v7a" \
+                   "$SOURCE_DIR/app/src/main/jniLibs/x86_64"
+          cd "$GITHUB_WORKSPACE/.cloudflared-src"
+          build_android() {
+            local arch="$1" abi="$2" cc="$3" api="$4" arm="${5:-}"
+            echo "Building cloudflared for $abi (android/$arch, API $api)"
+            if [ -n "$arm" ]; then
+              CGO_ENABLED=1 GOOS=android GOARCH="$arch" GOARM="$arm" \
+                CC="$TOOLCHAIN/$cc" GODEBUG=netdns=cgo \
+                go build -mod=readonly -trimpath -buildvcs=false -ldflags='-s -w' \
+                -o "$SOURCE_DIR/app/src/main/jniLibs/$abi/libcloudflared.so" ./cmd/cloudflared
+            else
+              CGO_ENABLED=1 GOOS=android GOARCH="$arch" \
+                CC="$TOOLCHAIN/$cc" GODEBUG=netdns=cgo \
+                go build -mod=readonly -trimpath -buildvcs=false -ldflags='-s -w' \
+                -o "$SOURCE_DIR/app/src/main/jniLibs/$abi/libcloudflared.so" ./cmd/cloudflared
+            fi
+            test -s "$SOURCE_DIR/app/src/main/jniLibs/$abi/libcloudflared.so"
+            chmod 755 "$SOURCE_DIR/app/src/main/jniLibs/$abi/libcloudflared.so"
+            file "$SOURCE_DIR/app/src/main/jniLibs/$abi/libcloudflared.so"
+          }
+          build_android arm64 arm64-v8a aarch64-linux-android21-clang 21
+          build_android arm armeabi-v7a armv7a-linux-androideabi19-clang 19 7
+          build_android amd64 x86_64 x86_64-linux-android21-clang 21
+          mkdir -p "$SOURCE_DIR/app/src/main/assets/third-party"
+          cp "$GITHUB_WORKSPACE/.cloudflared-src/LICENSE" "$SOURCE_DIR/app/src/main/assets/third-party/CLOUDFLARED-LICENSE.txt"
+          "$TOOLCHAIN/llvm-readelf" -h "$SOURCE_DIR/app/src/main/jniLibs/arm64-v8a/libcloudflared.so" | grep -q 'AArch64'
+          "$TOOLCHAIN/llvm-readelf" -h "$SOURCE_DIR/app/src/main/jniLibs/armeabi-v7a/libcloudflared.so" | grep -q 'ARM'
+          "$TOOLCHAIN/llvm-readelf" -h "$SOURCE_DIR/app/src/main/jniLibs/x86_64/libcloudflared.so" | grep -q 'X86-64'
+
+      - name: Install Gradle 8.9 with retry and mirror fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="8.9"
+          ZIP="$RUNNER_TEMP/gradle-$VERSION-bin.zip"
+          mkdir -p "$RUNNER_TEMP/gradle-dist"
+          downloaded=false
+          for URL in \
+            "https://downloads.gradle.org/distributions/gradle-$VERSION-bin.zip" \
+            "https://services.gradle.org/distributions/gradle-$VERSION-bin.zip"; do
+            echo "Mengunduh $URL"
+            if curl --fail --location --silent --show-error --retry 6 --retry-all-errors --retry-delay 3 --connect-timeout 20 --max-time 600 "$URL" -o "$ZIP" && test -s "$ZIP"; then
+              downloaded=true
+              break
+            fi
+          done
+          if [ "$downloaded" != true ]; then
+            echo "Gagal mengambil Gradle $VERSION dari kedua endpoint distribusi." >&2
+            exit 1
+          fi
+          CHECKSUM=""
+          for URL in \
+            "https://services.gradle.org/distributions/gradle-$VERSION-bin.zip.sha256" \
+            "https://downloads.gradle.org/distributions/gradle-$VERSION-bin.zip.sha256"; do
+            CHECKSUM=$(curl --fail --location --silent --show-error --retry 4 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 120 "$URL" || true)
+            CHECKSUM=$(printf '%s' "$CHECKSUM" | tr -d '[:space:]')
+            if [[ "$CHECKSUM" =~ ^[a-fA-F0-9]{64}$ ]]; then break; fi
+            CHECKSUM=""
+          done
+          if [ -z "$CHECKSUM" ]; then
+            echo "Checksum distribusi Gradle resmi tidak dapat diverifikasi." >&2
+            exit 1
+          fi
+          echo "$CHECKSUM  $ZIP" | sha256sum --check --status
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/gradle-dist"
+          echo "$RUNNER_TEMP/gradle-dist/gradle-$VERSION/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/gradle-dist/gradle-$VERSION/bin/gradle" --version
+
+      - name: Verify Gradle project root and packaged tunnel engines
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          test -f settings.gradle
+          test -f build.gradle
+          test -f app/build.gradle
+          test -s app/src/main/jniLibs/arm64-v8a/libcloudflared.so
+          test -s app/src/main/jniLibs/armeabi-v7a/libcloudflared.so
+          test -s app/src/main/jniLibs/x86_64/libcloudflared.so
+          gradle --version
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          gradle :app:assembleDebug --stacktrace
+
+      - name: Verify APK contains Android tunnel engines
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$SOURCE_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -l "$APK" | grep -E 'lib/(arm64-v8a|armeabi-v7a|x86_64)/libcloudflared.so'
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OHLI-Social-Server-APK-v3.6.27
+          path: ${{ env.SOURCE_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
